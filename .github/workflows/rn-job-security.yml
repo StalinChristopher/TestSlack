@@ -22,9 +22,11 @@ jobs:
             --error
       - name: TruffleHog
         run: |
+          # Pin version: install.sh uses latest tag; new tags often ship before binaries (404).
+          TRUFFLEHOG_VERSION="v3.95.3"
           TH_DIR="${RUNNER_TEMP}/trufflehog-bin"
           mkdir -p "$TH_DIR"
-          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b "$TH_DIR"
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b "$TH_DIR" "$TRUFFLEHOG_VERSION"
           export PATH="$TH_DIR:$PATH"
           trufflehog filesystem . --fail \
             --exclude-paths .github/trufflehog-exclude-paths.txt
