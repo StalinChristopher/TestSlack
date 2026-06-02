@@ -1,0 +1,91 @@
+# frozen_string_literal: true
+
+default_platform(:ios)
+
+platform :ios do
+  desc "CI: keychain signing (secrets) + gym IPA for App Store / TestFlight"
+  lane :staging_build do
+    team_id = ENV.fetch("APPLE_TEAM_ID")
+    profile_name = ENV.fetch("IOS_PROVISIONING_PROFILE_NAME")
+    bundle_id = ENV.fetch("APP_IDENTIFIER")
+
+    if ENV["GITHUB_ACTIONS"] == "true" && ENV["APP_STORE_CONNECT_KEY_ID"]
+      api_key = app_store_connect_api_key(
+        key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+        issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+        key_content: ENV.fetch("APP_STORE_CONNECT_API_KEY"),
+        is_key_content_base64: false,
+        duration: 1200,
+        in_house: false
+      )
+      latest = latest_testflight_build_number(
+        api_key: api_key,
+        app_identifier: bundle_id,
+        initial_build_number: 0
+      )
+      next_build = latest.to_i + 1
+      increment_build_number(
+        build_number: next_build.to_s,
+        xcodeproj: "ios/TestSlackDev.xcodeproj"
+      )
+      UI.success("Set CFBundleVersion to #{next_build} (latest TestFlight was #{latest.to_i})")
+    end
+
+    export_method = ENV["IOS_EXPORT_METHOD"].to_s.strip
+    export_method = "app-store" if export_method.empty?
+
+    xcargs = {
+      "CODE_SIGN_STYLE" => "Manual",
+      "DEVELOPMENT_TEAM" => team_id,
+      "PROVISIONING_PROFILE_SPECIFIER" => profile_name
+    }
+    identity = ENV["IOS_CODESIGN_IDENTITY"].to_s.strip
+    if identity.empty? && %w[app-store ad-hoc].include?(export_method)
+      identity = "Apple Distribution"
+    end
+    # Only CODE_SIGN_IDENTITY — bracketed sdk= keys break xcodebuild when gym passes xcargs via shell.
+    xcargs["CODE_SIGN_IDENTITY"] = identity if identity && !identity.empty?
+
+    bc = ENV["IOS_BUILD_CONFIGURATION"]
+    gym_args = {
+      workspace: "ios/TestSlackDev.xcworkspace",
+      scheme: ENV.fetch("IOS_SCHEME", "TestSlackDev"),
+      export_method: export_method,
+      output_directory: "build",
+      output_name: "TestSlackDev.ipa",
+      clean: true,
+      xcargs: xcargs,
+      export_options: {
+        method: export_method,
+        signingStyle: "manual",
+        teamID: team_id,
+        provisioningProfiles: {
+          bundle_id => profile_name
+        }
+      }
+    }
+    gym_args[:configuration] = bc.strip if bc && !bc.strip.empty?
+    gym(**gym_args)
+  end
+
+  desc "Upload an existing IPA to TestFlight (App Store Connect API key via env)"
+  lane :upload_testflight_ipa do |options|
+    ipa_path = options[:ipa] || ENV["IPA_PATH"]
+    UI.user_error!("Missing ipa path (pass ipa: or IPA_PATH)") if ipa_path.nil? || ipa_path.to_s.empty? || !File.exist?(ipa_path)
+
+    api_key = app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_content: ENV.fetch("APP_STORE_CONNECT_API_KEY"),
+      is_key_content_base64: false,
+      duration: 1200,
+      in_house: false
+    )
+
+    upload_to_testflight(
+      api_key: api_key,
+      ipa: ipa_path,
+      skip_waiting_for_build_processing: true
+    )
+  end
+end

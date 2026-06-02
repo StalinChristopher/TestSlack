@@ -1,0 +1,86 @@
+name: RN — iOS Simulator .app (unsigned)
+
+on:
+  workflow_call:
+    inputs:
+      ios_workspace:
+        type: string
+        default: ios/TestSlackDev.xcworkspace
+      ios_scheme:
+        type: string
+        default: TestSlackDev
+      ios_build_configuration:
+        type: string
+        default: Debug
+      # Must match Debug / Firebase dev app (simulator artifact is unsigned Debug).
+      product_bundle_identifier:
+        type: string
+        default: com.codeandtheory.templatetestpipeline.dev
+      artifact_name:
+        type: string
+        default: TestSlackDev-iphonesimulator-Debug
+
+env:
+  # Expo SDK 55 requires Xcode 26+; EAS defaults to 26.2. Same pin for bare + Expo iOS jobs.
+  XCODE_VERSION: "26.2"
+
+jobs:
+  sim-app:
+    name: iOS Debug Simulator .app
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore Firebase client config
+        uses: ./.github/actions/restore-firebase-client-config
+        with:
+          firebase_flavor: dev
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          GOOGLE_SERVICE_INFO_PLIST_DEV: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DEV }}
+          GOOGLE_SERVICE_INFO_PLIST_DIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DIST }}
+          GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - run: bash .github/scripts/install_js_deps.sh auto
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.2"
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler: "2.4.12"
+      - name: bundle install
+        run: bundle install
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: |
+            ios/Pods
+            ~/Library/Caches/CocoaPods
+          key: pods-${{ runner.os }}-${{ hashFiles('ios/Podfile.lock', 'ios/Podfile') }}
+      - name: pod install
+        run: bundle exec pod install --project-directory=ios
+      - name: Build Debug simulator .app
+        env:
+          WS: ${{ inputs.ios_workspace }}
+          SC: ${{ inputs.ios_scheme }}
+          BC: ${{ inputs.ios_build_configuration }}
+          DD: ${{ github.workspace }}/DerivedDataCI
+          PRODUCT_BUNDLE_IDENTIFIER: ${{ inputs.product_bundle_identifier }}
+        run: |
+          set -euo pipefail
+          DEST=$(python3 .github/scripts/ios_first_iphone_sim_udid.py)
+          xcodebuild build -workspace "$WS" -scheme "$SC" -configuration "$BC" \
+            -destination "$DEST" -derivedDataPath "$DD" \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            "PRODUCT_BUNDLE_IDENTIFIER=${PRODUCT_BUNDLE_IDENTIFIER}"
+          chmod +x .github/scripts/ios_find_simulator_app.sh
+          APP_PATH="$(.github/scripts/ios_find_simulator_app.sh "$DD" "$BC")"
+          echo "app_path=$APP_PATH" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ env.app_path }}
+          if-no-files-found: error

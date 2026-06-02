@@ -1,0 +1,189 @@
+# EAS cloud build (wait), download artifact, optional Firebase App Distribution (Expo).
+name: RN — Expo EAS build and optional Firebase
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: Git ref or SHA to checkout (PR head or push SHA)
+        required: true
+        type: string
+      platform:
+        description: android or ios
+        required: true
+        type: string
+      eas_profile:
+        description: EAS build profile from eas.json
+        required: false
+        type: string
+        default: development
+      upload_to_firebase:
+        description: Upload APK or IPA to Firebase App Distribution after download
+        required: false
+        type: boolean
+        default: false
+      firebase_groups:
+        required: false
+        type: string
+        default: internal-qa
+      firebase_android_app:
+        description: dev or dist (selects Firebase Android app id secret)
+        required: false
+        type: string
+        default: dev
+      firebase_ios_app:
+        description: dev or dist (selects Firebase iOS app id secret)
+        required: false
+        type: string
+        default: dev
+      release_notes:
+        required: false
+        type: string
+        default: ""
+      artifact_name:
+        description: GitHub Actions artifact name (upload-artifact)
+        required: true
+        type: string
+    secrets:
+      EXPO_TOKEN:
+        required: true
+      FIREBASE_SERVICE_ACCOUNT_JSON:
+        required: false
+      FIREBASE_ANDROID_APP_ID:
+        required: false
+      FIREBASE_ANDROID_DEV_APP_ID:
+        required: false
+      FIREBASE_IOS_APP_ID:
+        required: false
+      FIREBASE_IOS_DEV_APP_ID:
+        required: false
+
+jobs:
+  eas-build-publish:
+    name: EAS ${{ inputs.platform }} (${{ inputs.eas_profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+
+      - name: Restore Firebase client config
+        uses: ./.github/actions/restore-firebase-client-config
+        with:
+          firebase_flavor: ${{ inputs.platform == 'ios' && inputs.firebase_ios_app || inputs.firebase_android_app }}
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          GOOGLE_SERVICE_INFO_PLIST_DEV: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DEV }}
+          GOOGLE_SERVICE_INFO_PLIST_DIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DIST }}
+          GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install JS dependencies
+        run: bash .github/scripts/install_js_deps.sh auto
+
+      - uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: EAS cloud build (wait, JSON)
+        id: eas_build
+        run: |
+          set -euo pipefail
+          if [ -z "${EXPO_TOKEN:-}" ]; then
+            echo "::error::EXPO_TOKEN is not set"
+            exit 1
+          fi
+          OUT="${RUNNER_TEMP}/eas-build-result.json"
+          set +e
+          npx eas-cli build \
+            --platform "${{ inputs.platform }}" \
+            --profile "${{ inputs.eas_profile }}" \
+            --non-interactive \
+            --wait \
+            --json > "$OUT" 2> "${RUNNER_TEMP}/eas-build-stderr.log"
+          RC=$?
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::eas build failed (exit $RC). stderr tail:"
+            tail -n 80 "${RUNNER_TEMP}/eas-build-stderr.log" || true
+            exit "$RC"
+          fi
+          BUILD_ID="$(python3 .github/scripts/eas_extract_build_id.py "$OUT")"
+          echo "build_id=$BUILD_ID" >> "$GITHUB_OUTPUT"
+          echo "EAS build id: $BUILD_ID"
+
+      - name: Download build artifact
+        id: download
+        run: |
+          set -euo pipefail
+          OUT_DIR="${RUNNER_TEMP}/eas-ci-output"
+          mkdir -p "$OUT_DIR"
+          # eas build:download must run in the Expo project root (eas.json). Do not cd into an empty temp dir.
+          cd "${GITHUB_WORKSPACE}"
+          npx eas-cli build:download \
+            --non-interactive \
+            --build-id "${{ steps.eas_build.outputs.build_id }}"
+          shopt -s nullglob
+          apk=(./*.apk)
+          ipa=(./*.ipa)
+          if [ ${#apk[@]} -gt 0 ]; then
+            cp "${apk[0]}" "$OUT_DIR/upload.apk"
+            echo "artifact_path=$OUT_DIR/upload.apk" >> "$GITHUB_OUTPUT"
+            echo "artifact_type=apk" >> "$GITHUB_OUTPUT"
+          elif [ ${#ipa[@]} -gt 0 ]; then
+            cp "${ipa[0]}" "$OUT_DIR/upload.ipa"
+            echo "artifact_path=$OUT_DIR/upload.ipa" >> "$GITHUB_OUTPUT"
+            echo "artifact_type=ipa" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::No .apk or .ipa found after eas build:download"
+            ls -la
+            exit 1
+          fi
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ steps.download.outputs.artifact_path }}
+          if-no-files-found: error
+
+      - name: Upload APK to Firebase App Distribution
+        id: upload_firebase_android
+        if: ${{ inputs.upload_to_firebase && inputs.platform == 'android' }}
+        uses: wzieba/Firebase-Distribution-Github-Action@v1.7.1
+        with:
+          appId: ${{ inputs.firebase_android_app == 'dev' && secrets.FIREBASE_ANDROID_DEV_APP_ID || secrets.FIREBASE_ANDROID_APP_ID }}
+          serviceCredentialsFileContent: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          file: ${{ steps.download.outputs.artifact_path }}
+          groups: ${{ inputs.firebase_groups }}
+          releaseNotes: ${{ inputs.release_notes }}
+
+      - name: Upload IPA to Firebase App Distribution
+        id: upload_firebase_ios
+        if: ${{ inputs.upload_to_firebase && inputs.platform == 'ios' }}
+        env:
+          FIREBASE_APP_ID: ${{ inputs.firebase_ios_app == 'dist' && secrets.FIREBASE_IOS_APP_ID || secrets.FIREBASE_IOS_DEV_APP_ID }}
+          SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          GROUPS: ${{ inputs.firebase_groups }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          IPA_PATH: ${{ steps.download.outputs.artifact_path }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/firebase-sa.json"
+          chmod 600 "$RUNNER_TEMP/firebase-sa.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/firebase-sa.json"
+          CMD=(npx --yes firebase-tools@13 appdistribution:distribute "$IPA_PATH" --app "$FIREBASE_APP_ID" --groups "$GROUPS")
+          if [ -n "${RELEASE_NOTES:-}" ]; then
+            CMD+=(--release-notes "$RELEASE_NOTES")
+          fi
+          "${CMD[@]}"

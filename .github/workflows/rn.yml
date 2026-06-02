@@ -1,0 +1,309 @@
+# React Native CI/CD — orchestrator: JS + native dev builds (bare or Expo with committed ios/android).
+
+name: React Native CI/CD
+
+on:
+  push:
+    branches: [main, master, development]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    branches: [main, master, development]
+  workflow_dispatch:
+    inputs:
+      build_system:
+        description: "auto (expo if package.json lists expo) | bare | expo"
+        type: choice
+        options: [auto, bare, expo]
+        default: auto
+      package_manager:
+        description: "auto | npm | yarn (passed to install_js_deps in reusable jobs that support it)"
+        type: string
+        default: auto
+      run_internal_release_only:
+        description: Reserved for internal-only mode
+        type: boolean
+        default: false
+
+concurrency:
+  group: rn-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Runner configuration (secret-driven) ──────────────────────────────────
+  # Reads PERF_ANDROID_RUNNER and PERF_IOS_RUNNER repository secrets and emits
+  # all runner-related settings as outputs so downstream perf jobs can toggle
+  # between local self-hosted Mac and GitHub-hosted cloud runners without any
+  # YAML edits.
+  #
+  # PERF_ANDROID_RUNNER secret:
+  #   unset (default) → self-hosted Mac (arm64-v8a, GPU=auto, no SDK/JDK install)
+  #   "cloud"         → ubuntu-latest  (x86_64,    GPU=swiftshader_indirect, full SDK install)
+  #
+  # PERF_IOS_RUNNER secret:
+  #   unset (default) → macos-15 cloud runner (setup_xcode=true, use pre-built test products)
+  #   "self-hosted"   → runner labelled 'ios-perf' (setup_xcode=false, builds inline)
+  #   any other label → that exact runner label treated as self-hosted (setup_xcode=false)
+  determine-perf-runners:
+    runs-on: ubuntu-latest
+    outputs:
+      android_runner:       ${{ steps.pick.outputs.android_runner }}
+      android_arch:         ${{ steps.pick.outputs.android_arch }}
+      android_gpu:          ${{ steps.pick.outputs.android_gpu }}
+      android_setup_java:   ${{ steps.pick.outputs.android_setup_java }}
+      android_setup_python: ${{ steps.pick.outputs.android_setup_python }}
+      android_setup_node:   ${{ steps.pick.outputs.android_setup_node }}
+      android_setup_sdk:    ${{ steps.pick.outputs.android_setup_sdk }}
+      ios_runner:           ${{ steps.pick.outputs.ios_runner }}
+      ios_setup_xcode:      ${{ steps.pick.outputs.ios_setup_xcode }}
+      ios_setup_node:       ${{ steps.pick.outputs.ios_setup_node }}
+      # Non-empty when ios_runner is a GitHub-hosted macos-* runner — the
+      # ios-dev job will upload pre-built test products and ios-performance
+      # will download them, skipping build-for-testing.
+      ios_test_products_artifact: ${{ steps.pick.outputs.ios_test_products_artifact }}
+    steps:
+      - id: pick
+        env:
+          PERF_ANDROID_RUNNER: ${{ secrets.PERF_ANDROID_RUNNER }}
+          PERF_IOS_RUNNER: ${{ secrets.PERF_IOS_RUNNER }}
+        run: |
+          # ── Android ──────────────────────────────────────────────────────
+          ANDROID="${PERF_ANDROID_RUNNER:-}"
+          if [ "${ANDROID}" = "cloud" ] || [[ "${ANDROID}" == ubuntu* ]]; then
+            echo "android_runner=ubuntu-latest"          >> "$GITHUB_OUTPUT"
+            echo "android_arch=x86_64"                   >> "$GITHUB_OUTPUT"
+            echo "android_gpu=swiftshader_indirect"       >> "$GITHUB_OUTPUT"
+            echo "android_setup_java=true"               >> "$GITHUB_OUTPUT"
+            echo "android_setup_python=true"             >> "$GITHUB_OUTPUT"
+            echo "android_setup_node=true"               >> "$GITHUB_OUTPUT"
+            echo "android_setup_sdk=true"                >> "$GITHUB_OUTPUT"
+          else
+            echo "android_runner=self-hosted"            >> "$GITHUB_OUTPUT"
+            echo "android_arch=arm64-v8a"                >> "$GITHUB_OUTPUT"
+            echo "android_gpu=auto"                      >> "$GITHUB_OUTPUT"
+            echo "android_setup_java=false"              >> "$GITHUB_OUTPUT"
+            echo "android_setup_python=false"            >> "$GITHUB_OUTPUT"
+            echo "android_setup_node=false"              >> "$GITHUB_OUTPUT"
+            echo "android_setup_sdk=false"               >> "$GITHUB_OUTPUT"
+          fi
+
+          # ── iOS ──────────────────────────────────────────────────────────
+          IOS="${PERF_IOS_RUNNER:-}"
+          if [ -z "$IOS" ] || [[ "$IOS" == macos* ]]; then
+            # GitHub-hosted cloud runner (default): enable all setup steps and
+            # use the pre-built test products from ios-dev to skip build-for-testing.
+            echo "ios_runner=${IOS:-macos-15}"           >> "$GITHUB_OUTPUT"
+            echo "ios_setup_xcode=true"                  >> "$GITHUB_OUTPUT"
+            echo "ios_setup_node=true"                   >> "$GITHUB_OUTPUT"
+            echo "ios_test_products_artifact=ios-test-products-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          else
+            # Self-hosted runner: Xcode already installed, build inline.
+            echo "ios_runner=${IOS}"                     >> "$GITHUB_OUTPUT"
+            echo "ios_setup_xcode=false"                 >> "$GITHUB_OUTPUT"
+            echo "ios_setup_node=false"                  >> "$GITHUB_OUTPUT"
+            echo "ios_test_products_artifact="           >> "$GITHUB_OUTPUT"
+          fi
+
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      build_system: ${{ steps.pick.outputs.build_system }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: pick
+        run: |
+          set -euo pipefail
+          BS="${{ github.event.inputs.build_system }}"
+          if [ -z "${BS:-}" ] || [ "$BS" = "auto" ]; then
+            if python3 -c "import json; p=json.load(open('package.json')); d={**p.get('dependencies',{}),**p.get('devDependencies',{})}; raise SystemExit(0 if 'expo' in d else 1)" 2>/dev/null; then
+              echo "build_system=expo" >> "$GITHUB_OUTPUT"
+            else
+              echo "build_system=bare" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "build_system=$BS" >> "$GITHUB_OUTPUT"
+          fi
+
+  js-lint:
+    needs: [detect]
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_internal_release_only == false }}
+    uses: ./.github/workflows/rn-job-js-lint.yml
+
+  security:
+    needs: [detect]
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_internal_release_only == false }}
+    uses: ./.github/workflows/rn-job-security.yml
+    secrets: inherit
+
+  js-test:
+    needs: [js-lint, security]
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_internal_release_only == false }}
+    uses: ./.github/workflows/rn-job-js-test.yml
+    with:
+      coverage_threshold_percent: "80"
+
+  # Gate: Expo apps must commit android/ + ios/ (expo prebuild); bare repos no-op here. Same ref as native jobs (PR head).
+  expo-native-dirs:
+    if: |
+      (github.event_name != 'workflow_dispatch' || inputs.run_internal_release_only == false) &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/development')) ||
+       (github.event_name == 'pull_request' && (github.base_ref == 'main' || github.base_ref == 'master' || github.base_ref == 'development')))
+    needs: [detect, js-lint, security, js-test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Assert committed native dirs for Expo
+        env:
+          BUILD_SYSTEM: ${{ needs.detect.outputs.build_system }}
+        run: bash .github/scripts/assert_expo_native_dirs.sh "$BUILD_SYSTEM"
+
+  # --- Bare + Expo (committed native): dev APK + dev IPA (PR = artifacts; push = Firebase). Manual dist: rn-firebase-release.yml ---
+
+  android-dev:
+    if: |
+      (github.event_name != 'workflow_dispatch' || inputs.run_internal_release_only == false) &&
+      (needs.detect.outputs.build_system == 'bare' || needs.detect.outputs.build_system == 'expo') &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/development')) ||
+       (github.event_name == 'pull_request' && (github.base_ref == 'main' || github.base_ref == 'master' || github.base_ref == 'development')))
+    needs: [detect, js-lint, security, js-test, expo-native-dirs]
+    uses: ./.github/workflows/rn-job-android-firebase-release-bare.yml
+    with:
+      branch: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      firebase_android_app: dev
+      gradle_task: assembleRelease
+      artifact_glob: app/build/outputs/apk/release/*.apk
+      release_notes: ""
+      dry_run: false
+      upload_to_firebase: ${{ github.event_name == 'push' }}
+      firebase_groups: internal-qa
+    secrets: inherit
+
+  # ── Android performance gate ──────────────────────────────────────────────
+  # Waits for android-dev to finish, then downloads its signed APK artifact
+  # instead of running a second Gradle build. Zero redundant compilation.
+  #
+  # Gates 7 metrics on a self-hosted Mac emulator:
+  #   launch_time, fps, memory, cpu_spike, cpu_time, apk_size, memory_leak
+  #
+  # ── One-time self-hosted runner setup ─────────────────────────────────────
+  # 1. Repo → Settings → Actions → Runners → New self-hosted runner (macOS).
+  # 2. When prompted for labels, add: android
+  # 3. Ensure these are on PATH in the runner user's ~/.zprofile:
+  #      export ANDROID_HOME="$HOME/Library/Android/sdk"
+  #      export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+  #    Confirm: java -version (17+), python3 --version, adb version, emulator -version
+  # 4. Start: ./svc.sh install && ./svc.sh start
+  #
+  # ── Cloud fallback (when no self-hosted Mac is available) ─────────────────
+  # Comment out the self-hosted block, uncomment the cloud block.
+  android-perf:
+    needs: [android-dev, determine-perf-runners]
+    if: needs.android-dev.result == 'success'
+    uses: ./.github/workflows/rn-job-android-perf.yml
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      # ── App identity ────────────────────────────────────────────────────────
+      package: "com.codeandtheory.templatetestpipeline.dev"
+      # applicationId/fully-qualified MainActivity (dev flavor); bootstrap_rn_workflow_ids.py rewrites on kit apply
+      activity: "com.codeandtheory.templatetestpipeline.dev/com.codeandtheory.templatetestpipeline.dev.MainActivity"
+
+      # ── APK — download from android-dev instead of rebuilding ───────────────
+      # Artifact name pattern from rn-job-android-firebase-release-bare.yml line 69:
+      #   signed-apk-firebase-<firebase_android_app>-<run_number>
+      apk_artifact_name: "signed-apk-firebase-dev-${{ github.run_number }}"
+
+      # ── Runner — controlled via PERF_ANDROID_RUNNER secret ──────────────────
+      # Set secret to "cloud" for ubuntu-latest + full SDK install.
+      # Leave unset (default) for self-hosted Mac + ARM emulator.
+      runner:           ${{ needs.determine-perf-runners.outputs.android_runner }}
+      emulator_arch:    ${{ needs.determine-perf-runners.outputs.android_arch }}
+      emulator_gpu:     ${{ needs.determine-perf-runners.outputs.android_gpu }}
+      setup_java:       ${{ needs.determine-perf-runners.outputs.android_setup_java == 'true' }}
+      setup_python:     ${{ needs.determine-perf-runners.outputs.android_setup_python == 'true' }}
+      setup_node:       ${{ needs.determine-perf-runners.outputs.android_setup_node == 'true' }}
+      setup_android_sdk: ${{ needs.determine-perf-runners.outputs.android_setup_sdk == 'true' }}
+      job_timeout_minutes: 30
+
+      # ── Gates ────────────────────────────────────────────────────────────────
+      # After the first successful run on main the CI auto-switches to
+      # baseline-comparison mode (25% tolerance) stored on the perf-data branch.
+      baselines_path: "scripts/perf/perf_baselines.json"
+      baseline_tolerance_pct: 25
+      soft: false
+      fail_on_regression: false
+
+      # ── Report ───────────────────────────────────────────────────────────────
+      out_dir: "build/reports/perf"
+      artifact_retention_days: 14
+    secrets: inherit
+
+  ios-dev:
+    if: |
+      (github.event_name != 'workflow_dispatch' || inputs.run_internal_release_only == false) &&
+      (needs.detect.outputs.build_system == 'bare' || needs.detect.outputs.build_system == 'expo') &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/development')) ||
+       (github.event_name == 'pull_request' && (github.base_ref == 'main' || github.base_ref == 'master' || github.base_ref == 'development')))
+    needs: [detect, js-lint, security, js-test, expo-native-dirs, determine-perf-runners]
+    uses: ./.github/workflows/rn-job-ios-firebase-release-bare.yml
+    with:
+      branch: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      firebase_ios_app: dev
+      app_identifier: com.codeandtheory.templatetestpipeline.dev
+      ios_scheme: TestSlackDev
+      ios_workspace: ios/TestSlackDev.xcworkspace
+      dry_run: false
+      upload_to_firebase: ${{ github.event_name == 'push' }}
+      firebase_groups: internal-qa
+      release_notes: ""
+      # When running on a GitHub-hosted cloud runner, also build-for-testing for the
+      # simulator and upload test products so ios-performance can skip its own build.
+      produce_test_products: ${{ needs.determine-perf-runners.outputs.ios_test_products_artifact != '' }}
+    secrets: inherit
+
+  # ── iOS performance gate ──────────────────────────────────────────────────
+  # Runs XCTest UI performance tests (launch, CPU, memory) against the simulator.
+  # Compares to ci/performance-baseline.json stored on main.
+  #
+  # ── Runner toggle (via secrets) ────────────────────────────────────────────
+  # PERF_IOS_RUNNER secret controls the runner and all associated setup:
+  #   unset (default): macos-15 cloud runner + pre-built test products from ios-dev
+  #                    (skips build-for-testing, saves ~15 min of cloud compute).
+  #   "ios-perf":      self-hosted Mac runner + inline build (Xcode pre-installed).
+  #   any other label: that exact self-hosted runner label.
+  #
+  # ── First-time baseline note ───────────────────────────────────────────────
+  # If ci/performance-baseline.json does not exist on main yet, test failures
+  # will produce a warning (not a hard failure). Merge to main to record a
+  # baseline via the "Performance baseline (main)" workflow first.
+  ios-performance:
+    if: |
+      (github.event_name != 'workflow_dispatch' || inputs.run_internal_release_only == false) &&
+      (needs.detect.outputs.build_system == 'bare' || needs.detect.outputs.build_system == 'expo') &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/development')) ||
+       (github.event_name == 'pull_request' && (github.base_ref == 'main' || github.base_ref == 'master' || github.base_ref == 'development')))
+    needs: [detect, js-lint, security, js-test, expo-native-dirs, ios-dev, determine-perf-runners]
+    uses: ./.github/workflows/rn-job-ios-performance.yml
+    with:
+      perf_metrics_mode: full
+      pr_number: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+      # ── Runner — controlled via PERF_IOS_RUNNER secret ─────────────────────
+      runner:       ${{ needs.determine-perf-runners.outputs.ios_runner }}
+      setup_xcode:  ${{ needs.determine-perf-runners.outputs.ios_setup_xcode == 'true' }}
+      setup_node:   ${{ needs.determine-perf-runners.outputs.ios_setup_node == 'true' }}
+      # ── Pre-built test products from ios-dev (cloud runners only) ──────────
+      # Non-empty when ios_runner is a GitHub-hosted runner (paths guaranteed to match).
+      # Self-hosted runners get an empty string and build the test products inline.
+      test_products_artifact_name: ${{ needs.determine-perf-runners.outputs.ios_test_products_artifact }}
+      job_timeout_minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+    secrets: inherit

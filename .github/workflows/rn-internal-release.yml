@@ -1,0 +1,98 @@
+# Manual internal release: Gradle + Fastlane for bare or Expo (committed android/ios); same runner builds as rn.yml (no EAS).
+name: RN — internal release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_system:
+        description: "auto (expo if package.json lists expo) | bare | expo"
+        type: choice
+        options: [auto, bare, expo]
+        default: auto
+      platform:
+        description: android | ios | both
+        type: choice
+        options: [android, ios, both]
+        default: both
+      branch:
+        description: "Git branch or ref to build (e.g. main)"
+        required: true
+        type: string
+      release_notes:
+        description: Short notes for stakeholders (optional, Android)
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: Skips store upload / TestFlight
+        required: false
+        type: boolean
+        default: false
+      upload_to_testflight:
+        description: After gym, upload IPA to TestFlight (iOS)
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: rn-internal-release-${{ github.repository }}-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      build_system: ${{ steps.pick.outputs.build_system }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+      - id: pick
+        run: |
+          set -euo pipefail
+          BS="${{ inputs.build_system }}"
+          if [ -z "${BS:-}" ] || [ "$BS" = "auto" ]; then
+            if python3 -c "import json; p=json.load(open('package.json')); d={**p.get('dependencies',{}),**p.get('devDependencies',{})}; raise SystemExit(0 if 'expo' in d else 1)" 2>/dev/null; then
+              echo "build_system=expo" >> "$GITHUB_OUTPUT"
+            else
+              echo "build_system=bare" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "build_system=$BS" >> "$GITHUB_OUTPUT"
+          fi
+
+  expo-native-dirs:
+    needs: [detect]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+      - name: Assert committed native dirs for Expo
+        env:
+          BUILD_SYSTEM: ${{ needs.detect.outputs.build_system }}
+        run: bash .github/scripts/assert_expo_native_dirs.sh "$BUILD_SYSTEM"
+
+  android-bare:
+    needs: [detect, expo-native-dirs]
+    if: |
+      (needs.detect.outputs.build_system == 'bare' || needs.detect.outputs.build_system == 'expo') &&
+      (inputs.platform == 'android' || inputs.platform == 'both')
+    uses: ./.github/workflows/rn-job-android-internal-release-bare.yml
+    with:
+      branch: ${{ inputs.branch }}
+      release_notes: ${{ inputs.release_notes }}
+      dry_run: ${{ inputs.dry_run }}
+    secrets: inherit
+
+  ios-bare:
+    needs: [detect, expo-native-dirs]
+    if: |
+      (needs.detect.outputs.build_system == 'bare' || needs.detect.outputs.build_system == 'expo') &&
+      (inputs.platform == 'ios' || inputs.platform == 'both')
+    uses: ./.github/workflows/rn-job-ios-internal-release-bare.yml
+    with:
+      branch: ${{ inputs.branch }}
+      dry_run: ${{ inputs.dry_run }}
+      upload_to_testflight: ${{ inputs.upload_to_testflight }}
+    secrets: inherit

@@ -1,0 +1,49 @@
+# Submits the latest EAS iOS build to App Store / TestFlight (EAS submit).
+name: RN — iOS internal release (EAS submit)
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: Git branch or ref
+        required: true
+        type: string
+      profile:
+        description: EAS submit profile
+        type: string
+        default: production
+      dry_run:
+        type: boolean
+        default: false
+    secrets:
+      EXPO_TOKEN:
+        required: true
+
+jobs:
+  eas-submit-ios:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: bash .github/scripts/install_js_deps.sh auto
+      - uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+      - name: EAS submit (iOS)
+        if: ${{ inputs.dry_run == false }}
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          npx eas-cli submit --platform ios --profile "${{ inputs.profile }}" --latest --non-interactive
+      - name: Dry run
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "Dry run: would run eas submit --platform ios --profile ${{ inputs.profile }} --latest"

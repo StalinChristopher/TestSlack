@@ -1,0 +1,136 @@
+# Manual Firebase App Distribution: signed Android APK + signed iOS IPA (bare or Expo with committed android/ios; same Gradle + Fastlane jobs as rn.yml).
+name: RN — Firebase release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_system:
+        description: "auto (expo if package.json lists expo) | bare | expo — Expo uses committed native dirs + same bare Firebase jobs"
+        type: choice
+        options: [auto, bare, expo]
+        default: auto
+      platform:
+        description: "Android: android-dev, android-dist, android-both | iOS: ios-dev, ios-dist, ios-both | all = every variant"
+        type: choice
+        options: [android-dev, android-dist, android-both, ios-dev, ios-dist, ios-both, all]
+        default: all
+      branch:
+        description: "Git branch or ref to build (e.g. main)"
+        required: true
+        type: string
+      release_notes:
+        description: Release notes for Firebase testers (optional)
+        required: false
+        type: string
+        default: ""
+      firebase_groups:
+        description: Comma-separated Firebase App Distribution tester groups
+        required: false
+        type: string
+        default: internal-qa
+      dry_run:
+        description: Build and upload artifact only; skip Firebase and Slack
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: rn-firebase-${{ github.repository }}-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      build_system: ${{ steps.pick.outputs.build_system }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+      - id: pick
+        run: |
+          set -euo pipefail
+          BS="${{ inputs.build_system }}"
+          if [ -z "${BS:-}" ] || [ "$BS" = "auto" ]; then
+            if python3 -c "import json; p=json.load(open('package.json')); d={**p.get('dependencies',{}),**p.get('devDependencies',{})}; raise SystemExit(0 if 'expo' in d else 1)" 2>/dev/null; then
+              echo "build_system=expo" >> "$GITHUB_OUTPUT"
+            else
+              echo "build_system=bare" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "build_system=$BS" >> "$GITHUB_OUTPUT"
+          fi
+
+  expo-native-dirs:
+    needs: [detect]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+      - name: Assert committed native dirs for Expo
+        env:
+          BUILD_SYSTEM: ${{ needs.detect.outputs.build_system }}
+        run: bash .github/scripts/assert_expo_native_dirs.sh "$BUILD_SYSTEM"
+
+  android-firebase-dist:
+    needs: [detect, expo-native-dirs]
+    if: |
+      (needs.detect.outputs.build_system == 'bare' || needs.detect.outputs.build_system == 'expo') &&
+      (inputs.platform == 'android-dist' || inputs.platform == 'android-both' || inputs.platform == 'all')
+    uses: ./.github/workflows/rn-job-android-firebase-release-bare.yml
+    with:
+      branch: ${{ inputs.branch }}
+      firebase_android_app: dist
+      release_notes: ${{ inputs.release_notes }}
+      dry_run: ${{ inputs.dry_run }}
+      firebase_groups: ${{ inputs.firebase_groups }}
+    secrets: inherit
+
+  android-firebase-dev:
+    needs: [detect, expo-native-dirs]
+    if: |
+      (needs.detect.outputs.build_system == 'bare' || needs.detect.outputs.build_system == 'expo') &&
+      (inputs.platform == 'android-dev' || inputs.platform == 'android-both' || inputs.platform == 'all')
+    uses: ./.github/workflows/rn-job-android-firebase-release-bare.yml
+    with:
+      branch: ${{ inputs.branch }}
+      firebase_android_app: dev
+      gradle_task: assembleRelease
+      artifact_glob: app/build/outputs/apk/release/*.apk
+      release_notes: ${{ inputs.release_notes }}
+      dry_run: ${{ inputs.dry_run }}
+      firebase_groups: ${{ inputs.firebase_groups }}
+    secrets: inherit
+
+  ios-firebase-dist:
+    needs: [detect, expo-native-dirs]
+    if: |
+      (needs.detect.outputs.build_system == 'bare' || needs.detect.outputs.build_system == 'expo') &&
+      (inputs.platform == 'ios-dist' || inputs.platform == 'ios-both' || inputs.platform == 'all')
+    uses: ./.github/workflows/rn-job-ios-firebase-release-bare.yml
+    with:
+      branch: ${{ inputs.branch }}
+      firebase_ios_app: dist
+      app_identifier: com.codeandtheory.templatetestpipeline
+      ios_scheme: TestSlackDev
+      dry_run: ${{ inputs.dry_run }}
+      firebase_groups: ${{ inputs.firebase_groups }}
+      release_notes: ${{ inputs.release_notes }}
+    secrets: inherit
+
+  ios-firebase-dev:
+    needs: [detect, expo-native-dirs]
+    if: |
+      (needs.detect.outputs.build_system == 'bare' || needs.detect.outputs.build_system == 'expo') &&
+      (inputs.platform == 'ios-dev' || inputs.platform == 'ios-both' || inputs.platform == 'all')
+    uses: ./.github/workflows/rn-job-ios-firebase-release-bare.yml
+    with:
+      branch: ${{ inputs.branch }}
+      firebase_ios_app: dev
+      app_identifier: com.codeandtheory.templatetestpipeline.dev
+      ios_scheme: TestSlackDev
+      dry_run: ${{ inputs.dry_run }}
+      firebase_groups: ${{ inputs.firebase_groups }}
+      release_notes: ${{ inputs.release_notes }}
+    secrets: inherit

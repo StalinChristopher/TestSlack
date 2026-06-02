@@ -1,0 +1,308 @@
+# iOS UI performance tests (XCTest metrics) + baseline comparison on PRs.
+# Invoked from rn.yml after ios-dev (gates on successful dev IPA/simulator build).
+#
+# Runner modes — mirrors the Android perf workflow pattern:
+#   self-hosted (default): local Mac with Xcode + simulators pre-installed.
+#                          Zero cloud minutes; fastest simulator boot.
+#   macos-15 (cloud):      GitHub-hosted macOS runner.
+#                          Set runner: macos-15 and setup_xcode: true when no self-hosted Mac is available.
+#
+# Pre-built test products mode (recommended for cloud runners):
+#   Pass test_products_artifact_name pointing to the artifact uploaded by the ios-dev job.
+#   When set, build-for-testing is skipped; pod install, bundle install, and Node setup
+#   are also skipped since the test bundle is already compiled. Saves 15–20 min on macos-15.
+#   The artifact name must come from a build that ran on the same runner tier (same
+#   GITHUB_WORKSPACE path) — guaranteed for GitHub-hosted macos-* runners.
+name: RN — iOS UI performance
+
+on:
+  workflow_call:
+    inputs:
+      ios_workspace:
+        type: string
+        default: ios/TestSlackDev.xcworkspace
+      ios_scheme:
+        type: string
+        default: TestSlackDev
+      ios_build_configuration:
+        type: string
+        default: Debug
+        description: Must match the build configuration used in ios-dev (Debug)
+      simulator_destination:
+        type: string
+        default: auto
+      perf_metrics_mode:
+        type: string
+        default: full
+        description: full (launch + CPU/memory) or launch (smoke)
+      ios_performance_test_target:
+        type: string
+        default: ""
+        description: Optional override for -only-testing (empty = use perf_metrics_mode)
+      pr_number:
+        type: string
+        default: ""
+        description: PR number for posting the metrics comment (pass from caller on pull_request)
+      # ── Pre-built test products ────────────────────────────────────────────
+      test_products_artifact_name:
+        type: string
+        default: ""
+        description: >
+          Name of the artifact (uploaded by ios-dev via produce_test_products=true) that
+          contains the DerivedDataCI/Build/TestSlackDevucts directory.
+          When provided: build-for-testing, pod install, bundle install, and Node setup
+          are all skipped — the performance job only needs Xcode to run tests.
+          Leave empty to build the test products inline (slower but self-contained).
+      # ── Runner ────────────────────────────────────────────────────────────
+      runner:
+        type: string
+        default: "macos-15"
+        description: >
+          GitHub Actions runner label. Use 'self-hosted' (or a custom label like 'ios-perf')
+          for a local Mac runner (no cloud compute cost, Xcode + simulators pre-installed).
+          Use 'macos-15' for a GitHub-hosted cloud runner.
+      setup_xcode:
+        type: boolean
+        default: true
+        description: >
+          Install Xcode via maxim-lobanov/setup-xcode. Set false on self-hosted runners
+          that already have the required Xcode version on PATH.
+      setup_node:
+        type: boolean
+        default: true
+        description: >
+          Install Node.js via actions/setup-node. Set false on self-hosted runners
+          that already have a compatible Node version on PATH. Automatically skipped
+          when test_products_artifact_name is provided (no build step needed).
+      job_timeout_minutes:
+        type: number
+        default: 45
+        description: >
+          Overall job timeout in minutes. Self-hosted runners may need less time
+          since Xcode and simulators are already installed. When using pre-built
+          test products, 20 min is usually sufficient.
+
+env:
+  XCODE_VERSION: "26.2"
+  PERF_REGRESSION_THRESHOLD: "0.12"
+  PERF_FAIL_ON_REGRESSION: "false"
+  PERF_REGRESSION_GATE_SUBSTRINGS: "applaunch"
+
+jobs:
+  ui-performance:
+    name: iOS UI performance vs baseline
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.job_timeout_minutes }}
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      IOS_WORKSPACE: ${{ inputs.ios_workspace }}
+      IOS_SCHEME: ${{ inputs.ios_scheme }}
+      IOS_BUILD_CONFIGURATION: ${{ inputs.ios_build_configuration }}
+      SIMULATOR_DESTINATION: ${{ inputs.simulator_destination }}
+      PERF_METRICS_MODE: ${{ inputs.perf_metrics_mode }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore Firebase client config
+        uses: ./.github/actions/restore-firebase-client-config
+        with:
+          firebase_flavor: dev
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          GOOGLE_SERVICE_INFO_PLIST_DEV: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DEV }}
+          GOOGLE_SERVICE_INFO_PLIST_DIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DIST }}
+          GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}
+
+      # ── Attempt pre-built test products download FIRST ───────────────────
+      # Must run before the toolchain setup steps so their `if:` conditions can
+      # reference this step's outcome. continue-on-error so a missing artifact
+      # (e.g. build_for_testing failed in ios-dev) does not fail the job —
+      # we fall back to a full inline build-for-testing instead.
+      - name: Download test products artifact
+        id: download_test_products
+        if: ${{ inputs.test_products_artifact_name != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.test_products_artifact_name }}
+          path: ${{ github.workspace }}/DerivedDataCI/Build/TestSlackDevucts
+
+      - name: Set PREBUILT_DERIVED_DATA
+        if: ${{ inputs.test_products_artifact_name != '' && steps.download_test_products.outcome == 'success' }}
+        run: |
+          echo "PREBUILT_DERIVED_DATA=${{ github.workspace }}/DerivedDataCI" >> "$GITHUB_ENV"
+          echo "Using pre-built test products from ios-dev artifact '${{ inputs.test_products_artifact_name }}' — build-for-testing phase will be skipped."
+
+      - name: Pre-built artifact unavailable — will build inline
+        if: ${{ inputs.test_products_artifact_name != '' && steps.download_test_products.outcome != 'success' }}
+        run: echo "::warning::Test products artifact '${{ inputs.test_products_artifact_name }}' was not found (ios-dev build_for_testing may have failed or been skipped). Falling back to full inline build-for-testing."
+
+      # ── Toolchain setup — skipped when pre-built products were downloaded ─
+      # The condition `steps.download_test_products.outcome != 'success'` is true
+      # in three cases: artifact name was empty (no download attempted = skipped),
+      # download failed (fallback needed), or download succeeded (no build needed).
+      # We install toolchain when no pre-built products are available for use.
+      - name: Set up Node.js
+        if: ${{ inputs.setup_node && steps.download_test_products.outcome != 'success' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install JS dependencies
+        if: ${{ steps.download_test_products.outcome != 'success' }}
+        run: bash .github/scripts/install_js_deps.sh auto
+
+      - name: Restore CI env files
+        run: bash .github/scripts/restore_ci_env_files.sh
+
+      - name: Set up Xcode
+        if: ${{ inputs.setup_xcode }}
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.2"
+
+      - name: Set up Ruby + Bundler
+        if: ${{ steps.download_test_products.outcome != 'success' }}
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler: "2.4.12"
+
+      - name: bundle install
+        if: ${{ steps.download_test_products.outcome != 'success' }}
+        run: bundle install
+
+      - name: Cache CocoaPods
+        if: ${{ steps.download_test_products.outcome != 'success' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ios/Pods
+            ~/Library/Caches/CocoaPods
+          key: pods-${{ runner.os }}-${{ hashFiles('ios/Podfile.lock', 'ios/Podfile') }}
+
+      - name: pod install
+        if: ${{ steps.download_test_products.outcome != 'success' }}
+        run: bundle exec pod install --project-directory=ios
+
+      # ── Baseline loading ──────────────────────────────────────────────────
+      # Reads ci/performance-baseline.json from origin/main and sets has_baseline
+      # output. The "Fail if performance tests failed" step uses this to determine
+      # whether to fail the job (first-time setup = warn only, baseline present = fail).
+      - name: Baseline from main
+        id: baseline
+        run: |
+          mkdir -p "${{ github.workspace }}/build"
+          git fetch origin main 2>/dev/null || git fetch origin master 2>/dev/null || true
+          BASE_REF=""
+          if git cat-file -e origin/main:ci/performance-baseline.json 2>/dev/null; then
+            BASE_REF=origin/main
+          elif git cat-file -e origin/master:ci/performance-baseline.json 2>/dev/null; then
+            BASE_REF=origin/master
+          fi
+          if [ -n "${BASE_REF}" ]; then
+            git show "${BASE_REF}:ci/performance-baseline.json" > "${{ github.workspace }}/build/baseline.json"
+            echo "has_baseline=true" >> "$GITHUB_OUTPUT"
+          else
+            echo '{"schemaVersion":1,"metrics":{}}' > "${{ github.workspace }}/build/baseline.json"
+            echo "has_baseline=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No ci/performance-baseline.json on main yet — first-time setup. Merge to main or run Actions → Performance baseline (main) to record a baseline."
+          fi
+
+      - name: Run UI performance tests
+        id: perf_tests
+        continue-on-error: true
+        timeout-minutes: 40
+        run: |
+          chmod +x .github/scripts/ci_run_ios_ui_performance_tests.sh
+          .github/scripts/ci_run_ios_ui_performance_tests.sh
+
+      - name: Extract metrics JSON
+        if: steps.perf_tests.outcome != 'cancelled'
+        continue-on-error: true
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          if [[ ! -d build/TestResults.xcresult ]]; then
+            echo "::warning::No TestResults.xcresult — writing empty metrics (xcodebuild likely failed)."
+            echo '{"schemaVersion":1,"metrics":{}}' > build/current-metrics.json
+            exit 0
+          fi
+          python3 .github/scripts/extract_performance_metrics.py \
+            --xcresult build/TestResults.xcresult \
+            --xcodebuild-log build/xcodebuild-test.log \
+            --out build/current-metrics.json
+          python3 -c "import json; d=json.load(open('build/current-metrics.json')); print('PR metrics:', len(d.get('metrics') or {}), 'blobs:', d.get('rawPerformanceObjects'), 'logKeys:', d.get('logMetricKeys'))"
+
+      - name: Compare to baseline
+        id: compare
+        if: steps.perf_tests.outcome != 'cancelled'
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 .github/scripts/compare_performance.py \
+            --current build/current-metrics.json \
+            --baseline build/baseline.json \
+            --summary-out build/perf-comment.md
+
+      - name: PR comment
+        if: always() && inputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ -f build/perf-comment.md ]]; then
+            gh pr comment "${PR_NUMBER}" --body-file build/perf-comment.md
+          else
+            gh pr comment "${PR_NUMBER}" --body "Performance workflow did not produce a comparison report (tests or extraction failed). Check the workflow logs and uploaded xcresult artifact."
+          fi
+
+      - name: Upload xcresult
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-xcresult-${{ github.run_id }}
+          path: build/TestResults.xcresult
+          if-no-files-found: ignore
+
+      - name: Upload xcodebuild log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-xcodebuild-log-${{ github.run_id }}
+          path: build/xcodebuild-test.log
+          if-no-files-found: ignore
+
+      - name: Capture simulator diagnostics on failure
+        if: failure() && steps.perf_tests.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          echo "Simulator diagnostics:"
+          xcrun simctl list devices
+          echo ""
+          echo "Checking for crash logs:"
+          ls -la ~/Library/Logs/DiagnosticReports/ | tail -20 || true
+
+      - name: Fail on regression (opt-in)
+        if: steps.compare.outcome == 'failure'
+        run: |
+          echo "::error::Compare step requested failure (PERF_FAIL_ON_REGRESSION=true and a gated metric regressed)."
+          exit 1
+
+      # When ci/performance-baseline.json does not exist on main yet (first-time setup),
+      # xcodebuild performance tests may fail without a meaningful regression signal.
+      # Warn instead of failing so the first merge to main can establish the baseline.
+      - name: Fail if performance tests failed
+        if: steps.perf_tests.outcome == 'failure'
+        run: |
+          if [ "${{ steps.baseline.outputs.has_baseline }}" != "true" ]; then
+            echo "::warning::iOS performance tests failed but no baseline exists on main yet (first-time setup). Merge to main to record a baseline via the 'Performance baseline (main)' workflow, then failures will be enforced."
+          else
+            echo "::error::UI performance xcodebuild test failed — see xcodebuild log artifact. PR comment may still list extracted metrics."
+            exit 1
+          fi
