@@ -1,4 +1,4 @@
-package com.codeandtheory.templatetestpipeline.dev
+package com.codeandtheory.templatepipelinetest.dev
 
 import android.app.Application
 import android.content.res.Configuration

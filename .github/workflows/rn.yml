@@ -209,9 +209,9 @@ jobs:
       pull-requests: write
     with:
       # ── App identity ────────────────────────────────────────────────────────
-      package: "com.codeandtheory.templatetestpipeline.dev"
+      package: "com.codeandtheory.templatepipelinetest.dev"
       # applicationId/fully-qualified MainActivity (dev flavor); bootstrap_rn_workflow_ids.py rewrites on kit apply
-      activity: "com.codeandtheory.templatetestpipeline.dev/com.codeandtheory.templatetestpipeline.dev.MainActivity"
+      activity: "com.codeandtheory.templatepipelinetest.dev/com.codeandtheory.templatepipelinetest.dev.MainActivity"
 
       # ── APK — download from android-dev instead of rebuilding ───────────────
       # Artifact name pattern from rn-job-android-firebase-release-bare.yml line 69:
@@ -255,7 +255,7 @@ jobs:
     with:
       branch: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       firebase_ios_app: dev
-      app_identifier: com.codeandtheory.templatetestpipeline.dev
+      app_identifier: com.codeandtheory.templatepipelinetest.dev
       ios_scheme: TestSlackDev
       ios_workspace: ios/TestSlackDev.xcworkspace
       dry_run: false

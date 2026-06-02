@@ -15,7 +15,7 @@ on:
       # Must match Debug / Firebase dev app (simulator artifact is unsigned Debug).
       product_bundle_identifier:
         type: string
-        default: com.codeandtheory.templatetestpipeline.dev
+        default: com.codeandtheory.templatepipelinetest.dev
       artifact_name:
         type: string
         default: TestSlackDev-iphonesimulator-Debug

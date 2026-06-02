@@ -7,7 +7,7 @@ on:
         description: "iOS bundle ID for Fastlane (must match Xcode and provisioning profile)"
         type: string
         required: false
-        default: com.codeandtheory.templatetestpipeline
+        default: com.codeandtheory.templatepipelinetest
       ios_scheme:
         description: "Xcode scheme used by Fastlane gym"
         type: string

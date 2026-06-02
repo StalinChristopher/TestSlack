@@ -56,7 +56,7 @@ function resolveApiBaseUrl(appEnv: AppEnv): string {
 // SCAFFOLD PLACEHOLDERS — do not edit these strings manually.
 // The scaffolding tool (bin/index.js or the agentic SKILL) replaces:
 //   "TestSlack"     → the real app name   (e.g. "MyApp")
-//   "com.codeandtheory.templatetestpipeline" → the real package ID  (e.g. "com.example.myapp")
+//   "com.codeandtheory.templatepipelinetest" → the real package ID  (e.g. "com.example.myapp")
 //   "testslack"     → the lowercase slug   (e.g. "myapp")
 // ──────────────────────────────────────────────────────────────────────────────
 const flavors: Record<
@@ -65,18 +65,18 @@ const flavors: Record<
 > = {
   development: {
     name: "TestSlack Dev",
-    androidPackage: "com.codeandtheory.templatetestpipeline.dev",
-    iosBundleIdentifier: "com.codeandtheory.templatetestpipeline.dev",
+    androidPackage: "com.codeandtheory.templatepipelinetest.dev",
+    iosBundleIdentifier: "com.codeandtheory.templatepipelinetest.dev",
   },
   staging: {
     name: "TestSlack QA",
-    androidPackage: "com.codeandtheory.templatetestpipeline.qa",
-    iosBundleIdentifier: "com.codeandtheory.templatetestpipeline.qa",
+    androidPackage: "com.codeandtheory.templatepipelinetest.qa",
+    iosBundleIdentifier: "com.codeandtheory.templatepipelinetest.qa",
   },
   production: {
     name: "TestSlack",
-    androidPackage: "com.codeandtheory.templatetestpipeline",
-    iosBundleIdentifier: "com.codeandtheory.templatetestpipeline",
+    androidPackage: "com.codeandtheory.templatepipelinetest",
+    iosBundleIdentifier: "com.codeandtheory.templatepipelinetest",
   },
 };
 
