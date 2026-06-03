@@ -123,7 +123,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   slug: "testslack",
   /** Must stay aligned with `src/navigation/linking.ts` (`deepLinkSchemePrefix` / `expo-linking` scheme — without `://`). */
   scheme: "exporn",
-  version: "1.0.0",
+  version: "1.0.1",
   orientation: "portrait",
   icon: "./assets/icon.png",
   userInterfaceStyle: "automatic",

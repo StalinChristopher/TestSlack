@@ -37,17 +37,11 @@ fi
 
 "${CMD[@]}" 2>&1 | tee "${log}"
 
-testing_uri=""
-firebase_console_uri=""
-
-while IFS= read -r line; do
-  if [[ -z "${testing_uri}" ]] && [[ "${line}" == *appdistribution.firebase.google.com* ]]; then
-    testing_uri="$(printf '%s' "${line}" | grep -Eo 'https://[^[:space:]"<>]+appdistribution\.firebase\.google\.com[^[:space:]"<>]*' | head -n 1 || true)"
-  fi
-  if [[ -z "${firebase_console_uri}" ]] && [[ "${line}" == *console.firebase.google.com* ]]; then
-    firebase_console_uri="$(printf '%s' "${line}" | grep -Eo 'https://[^[:space:]"<>]+console\.firebase\.google\.com[^[:space:]"<>]*' | head -n 1 || true)"
-  fi
-done < "${log}"
+# Firebase prints URLs like https://appdistribution.firebase.google.com/... (host starts
+# right after https://). The old pattern required extra characters before the hostname and
+# never matched, so Slack fell back to the GitHub artifact link on iOS.
+testing_uri="$(grep -Eo 'https://appdistribution\.firebase\.google\.com[^[:space:]"<>]*' "${log}" | head -n 1 || true)"
+firebase_console_uri="$(grep -Eo 'https://console\.firebase\.google\.com[^[:space:]"<>]*' "${log}" | head -n 1 || true)"
 
 {
   echo "testing_uri=${testing_uri}"
@@ -56,6 +50,8 @@ done < "${log}"
 
 if [[ -n "${testing_uri}" ]]; then
   echo "Firebase App Distribution testing URL: ${testing_uri}"
+else
+  echo "::warning::Firebase distribute finished but no tester install URL was parsed from CLI output; Slack will fall back to the GitHub artifact link."
 fi
 if [[ -n "${firebase_console_uri}" ]]; then
   echo "Firebase console URL: ${firebase_console_uri}"
